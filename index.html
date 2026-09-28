@@ -67,6 +67,16 @@ tr.clickable{cursor:pointer}tr.clickable:hover{background:var(--bg)}
 .preview{margin-top:14px;padding:14px;border:1px dashed var(--line);border-radius:10px;display:none}
 #toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 18px;border-radius:8px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:9}
 #toast.show{opacity:1}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;padding:16px;z-index:20}
+.overlay[hidden]{display:none}
+.setup-card{max-width:520px;width:100%;margin:0}
+.banner{border-color:var(--warn);background:var(--warn-soft)}
+.banner[hidden]{display:none}
+.sync{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);padding:0 6px}
+.sync i{width:9px;height:9px;border-radius:50%;background:var(--muted);display:inline-block}
+.sync.ok i{background:var(--ok)}.sync.busy i{background:var(--warn)}.sync.err i{background:var(--err)}
+.sync.err{color:var(--err)}
+.btn:disabled{opacity:.55;cursor:not-allowed}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 @media (max-width:760px){.grid2{grid-template-columns:1fr}}
 </style>
@@ -75,11 +85,27 @@ tr.clickable{cursor:pointer}tr.clickable:hover{background:var(--bg)}
 <header>
   <h1><span>Myntra</span> Returns Reconciliation</h1>
   <div class="hdr-actions">
-    <button class="btn sm" id="backupBtn">Backup data</button>
-    <button class="btn sm" id="restoreBtn">Restore</button>
+    <span class="sync" id="syncStatus"><i></i><span>Not connected</span></span>
+    <button class="btn sm" id="refreshBtn" title="Load latest data">↻ Refresh</button>
+    <button class="btn sm" id="backupBtn">Backup</button>
+    <button class="btn sm" id="restoreBtn" title="Import a backup file into the Google Sheet">Import backup</button>
+    <button class="btn sm" id="settingsBtn">⚙ Connection</button>
     <input type="file" id="restoreFile" accept=".json" hidden>
   </div>
 </header>
+<div id="setup" class="overlay" hidden>
+  <div class="card setup-card">
+    <h2>Connect to your Google Sheet</h2>
+    <p class="muted" style="margin-top:0">All uploads and scans are saved in a Google Sheet, so every computer and phone sees the same data. Paste the Apps Script web app URL and the access key you set in the script.</p>
+    <label for="cfgUrl">Apps Script web app URL</label>
+    <input id="cfgUrl" placeholder="https://script.google.com/macros/s/…/exec" style="width:100%;margin-bottom:12px">
+    <label for="cfgKey">Access key</label>
+    <input id="cfgKey" type="password" placeholder="Access key" style="width:100%;margin-bottom:12px">
+    <div id="cfgErr" style="color:var(--err);min-height:22px;font-size:14px"></div>
+    <div class="row"><button class="btn primary" id="cfgSave">Connect</button><button class="btn" id="cfgCancel">Cancel</button></div>
+  </div>
+</div>
+<div id="loading" class="overlay" hidden><div class="card" style="text-align:center">Loading data from Google Sheet…</div></div>
 <nav>
   <button data-tab="upload" class="active">Upload</button>
   <button data-tab="recon">Reconcile</button>
@@ -88,6 +114,11 @@ tr.clickable{cursor:pointer}tr.clickable:hover{background:var(--bg)}
 </nav>
 
 <main>
+<div class="card banner" id="oldBanner" hidden>
+  <strong>Data found saved only in this browser</strong>
+  <p style="margin:6px 0 12px" id="oldBannerText"></p>
+  <div class="row"><button class="btn primary" id="oldMove">Move it to Google Sheet</button><button class="btn" id="oldDiscard">Discard it</button></div>
+</div>
 <!-- UPLOAD -->
 <section id="tab-upload" class="active">
   <div class="card">
@@ -160,28 +191,117 @@ tr.clickable{cursor:pointer}tr.clickable:hover{background:var(--bg)}
 <div id="toast"></div>
 
 <script>
-const KEY='rawayi_myntra_recon_v1';
-let db=load();
-let pending=null;
+/* ================= CONFIG =================
+   Optional: paste your Apps Script web app URL between the quotes so every
+   device only needs the access key. Leave empty to enter it in the app. */
+const API_URL_DEFAULT='https://script.google.com/macros/s/AKfycbxFr1qRsdX2CufgDDvc_5Rak-snQ8rpxnAL1ZH1LUEIK0QwwcvW1RpDne1z29bgUeir/exec';
+/* ========================================== */
+const CFG_KEY='rawayi_myntra_recon_cfg';
+const OLD_KEY='rawayi_myntra_recon_v1';
+let cfg=loadCfg();
+let db={days:{},scans:[]};
+let pending=null,busy=0,lastErr=null,connected=false,lastShownSid=null;
+const queue=[];let pumping=false;
 
-function load(){try{const d=JSON.parse(localStorage.getItem(KEY));if(d&&d.days)return d;}catch(e){}return{days:{},scans:[]};}
-function save(){try{localStorage.setItem(KEY,JSON.stringify(db));}catch(e){toast('Could not save — browser storage may be full');}}
+function loadCfg(){try{return JSON.parse(localStorage.getItem(CFG_KEY))||{};}catch(e){return{};}}
+function saveCfg(){try{localStorage.setItem(CFG_KEY,JSON.stringify(cfg));}catch(e){}}
+const apiUrl=()=>(cfg.url||API_URL_DEFAULT||'').trim();
+const ready=()=>!!(apiUrl()&&cfg.key&&connected);
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const pad=n=>String(n).padStart(2,'0');
 const todayStr=()=>{const d=new Date();return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;};
 const fmtDate=s=>{if(!s)return'';const[y,m,d]=s.split('-');return `${d}-${m}-${y}`;};
-const fmtTime=t=>new Date(t).toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});
+const fmtTime=t=>t?new Date(t).toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}):'';
 const norm=v=>String(v??'').trim().toUpperCase().replace(/\s+/g,'');
 const cellStr=v=>(typeof v==='number'&&Number.isInteger(v))?v.toLocaleString('fullwide',{useGrouping:false}):String(v??'');
-const getDay=d=>db.days[d]||(db.days[d]={uploads:[],items:{}});
-function toast(m){const t=$('toast');t.textContent=m;t.classList.add('show');clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),2600);}
+function toast(m){const t=$('toast');t.textContent=m;t.classList.add('show');clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),3200);}
 let actx;function beep(ok){try{actx=actx||new(window.AudioContext||window.webkitAudioContext)();const o=actx.createOscillator(),g=actx.createGain();o.type=ok?'sine':'square';o.frequency.value=ok?880:200;g.gain.value=.08;o.connect(g);g.connect(actx.destination);o.start();o.stop(actx.currentTime+(ok?.12:.4));}catch(e){}}
 
+/* ---------- Server ---------- */
+async function api(action,payload={},url=apiUrl(),key=cfg.key){
+  let r;
+  try{r=await fetch(url,{method:'POST',body:JSON.stringify({action,key,...payload})});}
+  catch(e){const err=new Error('No connection to Google Sheet');err.network=true;throw err;}
+  let j;try{j=await r.json();}catch(e){const err=new Error('Unexpected reply — check the web app URL and that access is set to "Anyone"');err.network=!r.ok;throw err;}
+  if(!j.ok){const err=new Error(j.error||'Request failed');err.server=true;throw err;}
+  return j;
+}
+function renderSync(){
+  const el=$('syncStatus'),txt=el.querySelector('span');
+  const n=queue.length;
+  el.className='sync '+(!connected?'err':lastErr?'err':(n||busy)?'busy':'ok');
+  txt.textContent=!connected?'Not connected':lastErr?`Offline — ${n} waiting`:(n||busy)?`Saving${n?' '+n:''}…`:'Saved to Google Sheet';
+}
+async function pump(){
+  if(pumping)return;pumping=true;
+  while(queue.length){
+    const job=queue[0];renderSync();
+    try{const res=await api(job.action,job.data);queue.shift();lastErr=null;job.done&&job.done(res);}
+    catch(e){
+      if(e.server){queue.shift();toast('Could not save: '+e.message);job.fail&&job.fail(e);}
+      else{lastErr=e.message;renderSync();await sleep(4000);}
+    }
+  }
+  pumping=false;renderSync();
+}
+window.addEventListener('beforeunload',e=>{if(queue.length){e.preventDefault();e.returnValue='';}});
+
+async function refresh(showToast){
+  if(!ready()||queue.length||pumping||busy)return;
+  try{const res=await api('state');if(queue.length||busy)return;db=res.db;lastErr=null;renderAll();if(showToast)toast('Up to date');}
+  catch(e){lastErr=e.message;if(showToast)toast(e.message);}
+  renderSync();
+}
+setInterval(()=>refresh(false),30000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh(false);});
+$('refreshBtn').onclick=()=>refresh(true);
+
+/* ---------- Setup ---------- */
+function openSetup(msg){
+  $('cfgUrl').value=apiUrl();$('cfgKey').value=cfg.key||'';$('cfgErr').textContent=msg||'';
+  $('cfgCancel').style.display=connected?'':'none';
+  $('setup').hidden=false;setTimeout(()=>$((apiUrl()?'cfgKey':'cfgUrl')).focus(),50);
+}
+$('settingsBtn').onclick=()=>openSetup();
+$('cfgCancel').onclick=()=>{$('setup').hidden=true;};
+$('cfgKey').addEventListener('keydown',e=>{if(e.key==='Enter')$('cfgSave').click();});
+$('cfgSave').onclick=async()=>{
+  const url=$('cfgUrl').value.trim(),key=$('cfgKey').value.trim();
+  if(!/^https:\/\/script\.google(usercontent)?\.com\//.test(url)){$('cfgErr').textContent='Paste the web app URL from Apps Script (starts with https://script.google.com/…)';return;}
+  if(!key){$('cfgErr').textContent='Enter the access key';return;}
+  $('cfgSave').disabled=true;$('cfgSave').textContent='Connecting…';$('cfgErr').textContent='';
+  try{
+    const res=await api('state',{},url,key);
+    cfg={url,key};saveCfg();connected=true;lastErr=null;db=res.db;
+    $('setup').hidden=true;renderAll();checkOld();toast('Connected to Google Sheet');
+  }catch(e){$('cfgErr').textContent=e.message;}
+  $('cfgSave').disabled=false;$('cfgSave').textContent='Connect';renderSync();
+};
+
+/* ---------- Old browser-only data ---------- */
+function readOld(){try{const d=JSON.parse(localStorage.getItem(OLD_KEY));return d&&d.days&&Object.keys(d.days).length?d:null;}catch(e){return null;}}
+function checkOld(){
+  const old=readOld();$('oldBanner').hidden=!old;if(!old)return;
+  const days=Object.keys(old.days).length,sheets=Object.values(old.days).reduce((a,d)=>a+d.uploads.length,0);
+  $('oldBannerText').textContent=`This browser still has ${sheets} sheet(s) across ${days} day(s) and ${(old.scans||[]).length} scan(s) from before the Google Sheet was connected. Move them so everyone can see them.`;
+}
+$('oldMove').onclick=async()=>{
+  const old=readOld();if(!old)return;
+  $('oldMove').disabled=true;$('oldMove').textContent='Moving…';
+  try{const res=await api('import',{db:old});db=res.db;localStorage.removeItem(OLD_KEY);renderAll();checkOld();
+    toast(`Moved ${res.imported.uploads} sheets, ${res.imported.items} tracking IDs, ${res.imported.scans} scans`);}
+  catch(e){toast('Move failed: '+e.message);}
+  $('oldMove').disabled=false;$('oldMove').textContent='Move it to Google Sheet';
+};
+$('oldDiscard').onclick=()=>{if(confirm('Delete the old data saved only in this browser? This cannot be undone.')){localStorage.removeItem(OLD_KEY);checkOld();}};
+
+/* ---------- Stats ---------- */
 function dayStats(date){
   const d=db.days[date];
   const items=d?Object.values(d.items):[];
-  const returns=d?d.uploads.reduce((a,u)=>a+u.rows,0):0;
+  const returns=d?d.uploads.reduce((a,u)=>a+(+u.rows||0),0):0;
   const rec=items.filter(i=>i.rec).length;
   return{returns,unique:items.length,rec,remaining:items.length-rec,sheets:d?d.uploads.length:0,
     recLater:items.filter(i=>i.rec&&i.recOn!==date).length};
@@ -194,6 +314,7 @@ function allPending(){
   return out;
 }
 function statCard(v,l,cls=''){return `<div class="stat ${cls}"><div class="v">${v}</div><div class="l">${l}</div></div>`;}
+function needConn(){if(!ready()){openSetup('Connect to the Google Sheet first');return true;}return false;}
 
 /* ---------- Tabs ---------- */
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>showTab(b.dataset.tab));
@@ -257,52 +378,53 @@ function renderPreview(){
   $('pvAdd').onclick=()=>commitUpload(ids);
 }
 function clearPreview(){pending=null;$('upPreview').style.display='none';$('upFile').value='';}
-function commitUpload(ids){
+async function waitQueue(){let n=0;while((queue.length||pumping)&&n<40){await sleep(250);n++;}return !queue.length;}
+async function commitUpload(ids){
+  if(needConn())return;
   const date=$('upDate').value;if(!date){toast('Pick a date first');return;}
-  const d=getDay(date),uid='u'+Date.now();
-  let dup=0,alreadyRec=0;
-  for(const{id,sku}of ids){
-    const it=d.items[id];
-    if(it){dup++;if(!it.uploads.includes(uid))it.uploads.push(uid);if(!it.sku&&sku)it.sku=sku;}
-    else d.items[id]={sku,uploads:[uid],rec:false,recAt:null,recOn:null};
-  }
-  d.uploads.push({id:uid,name:pending.name,at:Date.now(),rows:ids.length,dup});
-  save();clearPreview();renderAll();
-  toast(`Added ${ids.length} returns to ${fmtDate(date)}${dup?` (${dup} IDs already in this day)`:''}`);
+  const btn=$('pvAdd');btn.disabled=true;btn.textContent='Saving to Google Sheet…';
+  busy++;renderSync();
+  try{
+    if(!await waitQueue())throw new Error('Scans are still waiting to save. Check the connection and try again.');
+    const res=await api('upload',{date,name:pending.name,ids});
+    db=res.db;clearPreview();renderAll();
+    toast(`Added ${res.rows} returns to ${fmtDate(date)}${res.dup?` (${res.dup} IDs already in this day)`:''}`);
+  }catch(e){toast('Upload failed: '+e.message);if($('pvAdd')){$('pvAdd').disabled=false;$('pvAdd').textContent='Add sheet';}}
+  busy--;renderSync();
+}
+async function runDelete(action,data,okMsg){
+  busy++;renderSync();
+  try{
+    if(!await waitQueue())throw new Error('Scans are still waiting to save. Try again in a moment.');
+    const res=await api(action,data);db=res.db;renderAll();toast(okMsg);
+  }catch(e){toast('Delete failed: '+e.message);}
+  busy--;renderSync();
 }
 function deleteUpload(date,uid){
+  if(needConn())return;
   const d=db.days[date],up=d&&d.uploads.find(u=>u.id===uid);if(!up)return;
   const onlyHere=Object.entries(d.items).filter(([,it])=>it.uploads.length===1&&it.uploads[0]===uid);
   const recCount=onlyHere.filter(([,it])=>it.rec).length;
   let msg=`Delete "${up.name}" from ${fmtDate(date)}?\n\n• ${up.rows} returns will be removed from this day's count\n• ${onlyHere.length} tracking IDs that are only in this sheet will be removed`;
   if(recCount)msg+=`\n\n⚠ ${recCount} of those IDs were already scanned. Their scans will be removed too.`;
   if(!confirm(msg))return;
-  const removed=new Set(onlyHere.map(([id])=>id));
-  for(const[id,it]of Object.entries(d.items)){it.uploads=it.uploads.filter(u=>u!==uid);if(!it.uploads.length)delete d.items[id];}
-  d.uploads=d.uploads.filter(u=>u.id!==uid);
-  if(!d.uploads.length)delete db.days[date];
-  db.scans=db.scans.filter(s=>!(s.src===date&&removed.has(s.id)));
-  save();renderAll();
-  toast(`Deleted "${up.name}" from ${fmtDate(date)}`);
+  runDelete('deleteUpload',{date,uid},`Deleted "${up.name}" from ${fmtDate(date)}`);
 }
 function deleteDay(date){
+  if(needConn())return;
   const d=db.days[date];if(!d)return;
   const recCount=Object.values(d.items).filter(i=>i.rec).length;
   let msg=`Delete ALL ${d.uploads.length} sheet(s) for ${fmtDate(date)}?\n\nThis removes ${Object.keys(d.items).length} tracking IDs for this day.`;
   if(recCount)msg+=`\n\n⚠ ${recCount} of them were already scanned. Their scans will be removed too.`;
   if(!confirm(msg))return;
-  const ids=new Set(Object.keys(d.items));
-  delete db.days[date];
-  db.scans=db.scans.filter(s=>!(s.src===date&&ids.has(s.id)));
-  save();renderAll();
-  toast(`Deleted all sheets for ${fmtDate(date)}`);
+  runDelete('deleteDay',{date},`Deleted all sheets for ${fmtDate(date)}`);
 }
 function renderUpload(){
   const date=$('upDate').value,s=dayStats(date),d=db.days[date];
   $('upDateLabel').textContent=fmtDate(date);
   $('upStats').innerHTML=statCard(s.returns,'Returns for the day')+statCard(s.sheets,'Sheets uploaded')+statCard(s.unique,'Unique tracking IDs')+statCard(s.remaining,'Yet to reconcile','err');
   if(!d||!d.uploads.length){$('upList').innerHTML='<div class="empty">No sheets uploaded for this date yet.</div>';return;}
-  $('upList').innerHTML=`<div class="tbl-wrap"><table><tr><th>File</th><th>Uploaded</th><th>Rows</th><th>Repeat IDs</th><th></th></tr>${d.uploads.map(u=>`<tr><td>${esc(u.name)}</td><td>${fmtTime(u.at)}</td><td>${u.rows}</td><td>${u.dup||0}</td><td><button class="btn sm danger" data-del="${u.id}">🗑 Delete</button></td></tr>`).join('')}</table></div>
+  $('upList').innerHTML=`<div class="tbl-wrap"><table><tr><th>File</th><th>Uploaded</th><th>Rows</th><th>Repeat IDs</th><th></th></tr>${d.uploads.map(u=>`<tr><td>${esc(u.name)}</td><td>${fmtTime(u.at)}</td><td>${u.rows}</td><td>${u.dup||0}</td><td><button class="btn sm danger" data-del="${esc(u.id)}">🗑 Delete</button></td></tr>`).join('')}</table></div>
    ${d.uploads.length>1?`<div style="margin-top:12px;text-align:right"><button class="btn sm danger" id="delDay">🗑 Delete all sheets for ${fmtDate(date)}</button></div>`:''}`;
   $('upList').querySelectorAll('[data-del]').forEach(b=>b.onclick=()=>deleteUpload(date,b.dataset.del));
   if($('delDay'))$('delDay').onclick=()=>deleteDay(date);
@@ -311,39 +433,54 @@ function renderUpload(){
 /* ---------- Reconcile ---------- */
 $('rcDate').onchange=()=>{renderRecon();$('scanInput').focus();};
 $('scanInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();doScan(e.target.value);e.target.value='';}});
+function locate(id,date){
+  const d=db.days[date];if(d&&d.items[id])return date;
+  let first=null;
+  for(const k of Object.keys(db.days).sort()){
+    if(k===date)continue;const o=db.days[k].items[id];
+    if(o){if(!o.rec)return k;if(!first)first=k;}
+  }
+  return first;
+}
+const MSG={
+  ok:(s)=>['ok','✓ Reconciled',`${s.id}${s.sku?' · '+s.sku:''} — found in ${fmtDate(s.src)} sheet`],
+  missing:(s)=>['info','✓ Found in Missing IDs list',`${s.id}${s.sku?' · '+s.sku:''} — was pending from ${fmtDate(s.src)}, now reconciled`],
+  dup:(s)=>['warn','Already scanned',`${s.id} was already reconciled (sheet date ${fmtDate(s.src)})`],
+  notfound:(s)=>['err','✗ Not found',`${s.id} is not in this date's sheets or the Missing IDs list`]
+};
+function showScanResult(s){
+  const m=MSG[s.result](s),r=$('scanResult');lastShownSid=s.sid;
+  r.className='result '+m[0];r.innerHTML=`${m[1]}<small>${esc(m[2])}</small>`;
+}
+function applyItem(it){
+  const d=db.days[it.date];if(d&&d.items[it.id])Object.assign(d.items[it.id],{rec:it.rec,recAt:it.recAt,recOn:it.recOn});
+}
 function doScan(raw){
   const id=norm(raw);if(!id)return;
-  const date=$('rcDate').value,now=Date.now();
-  let result,src=null,sku='';
-  const d=db.days[date],it=d&&d.items[id];
-  if(it){
-    sku=it.sku;src=date;
-    if(it.rec)result='dup';else{it.rec=true;it.recAt=now;it.recOn=date;result='ok';}
-  }else{
-    for(const k of Object.keys(db.days).sort()){
-      if(k===date)continue;const o=db.days[k].items[id];
-      if(o){sku=o.sku;src=k;if(o.rec)result='dup';else{o.rec=true;o.recAt=now;o.recOn=date;result='missing';}break;}
-    }
-    if(!result)result='notfound';
-  }
-  db.scans.push({id,at:now,date,result,src,sku});
-  save();
-  const r=$('scanResult');
-  const msg={
-    ok:['ok','✓ Reconciled',`${id}${sku?' · '+sku:''} — found in ${fmtDate(date)} sheet`],
-    missing:['info','✓ Found in Missing IDs list',`${id}${sku?' · '+sku:''} — was pending from ${fmtDate(src)}, now reconciled`],
-    dup:['warn','Already scanned',`${id} was already reconciled (sheet date ${fmtDate(src)})`],
-    notfound:['err','✗ Not found',`${id} is not in this date's sheets or the Missing IDs list`]
-  }[result];
-  r.className='result '+msg[0];r.innerHTML=`${msg[1]}<small>${esc(msg[2])}</small>`;
-  beep(result==='ok'||result==='missing');
-  renderAll();
+  if(needConn())return;
+  const date=$('rcDate').value,at=Date.now(),sid='s'+at+Math.random().toString(36).slice(2,6);
+  const src=locate(id,date);let result='notfound',sku='',prev=null,it=null;
+  if(src){it=db.days[src].items[id];sku=it.sku;
+    if(it.rec)result='dup';else{prev={rec:it.rec,recAt:it.recAt,recOn:it.recOn};it.rec=true;it.recAt=at;it.recOn=date;result=src===date?'ok':'missing';}}
+  const scan={sid,id,at,date,result,src,sku,pending:true};
+  db.scans.push(scan);
+  showScanResult(scan);beep(result==='ok'||result==='missing');renderAll();
+  queue.push({action:'scan',data:{sid,id,date,at},done:res=>{
+    const s=res.scan;
+    if(prev&&(s.src!==src||s.result!==result))Object.assign(it,prev);
+    Object.assign(scan,s,{pending:false});
+    if(res.item)applyItem(res.item);
+    if(s.result!==result){toast(`Updated: ${id} → ${MSG[s.result](s)[1]} (someone else scanned it)`);if(lastShownSid===sid)showScanResult(scan);}
+    renderAll();
+  },fail:()=>{if(prev)Object.assign(it,prev);db.scans=db.scans.filter(x=>x!==scan);renderAll();}});
+  pump();
 }
-function undoScan(idx){
-  const s=db.scans[idx];if(!s||s.undone)return;
-  const it=db.days[s.src]&&db.days[s.src].items[s.id];
+function undoScan(sid){
+  const s=db.scans.find(x=>x.sid===sid);if(!s||s.undone)return;
+  const it=s.src&&db.days[s.src]&&db.days[s.src].items[s.id];
   if(it){it.rec=false;it.recAt=null;it.recOn=null;}
-  s.undone=true;save();renderAll();toast('Scan undone');
+  s.undone=true;renderAll();toast('Scan undone');
+  queue.push({action:'undo',data:{sid},done:res=>{if(res.item)applyItem(res.item);renderAll();}});pump();
 }
 const resPill={ok:'<span class="pill ok">Reconciled</span>',missing:'<span class="pill info">From missing list</span>',dup:'<span class="pill warn">Duplicate scan</span>',notfound:'<span class="pill err">Not found</span>'};
 function renderRecon(){
@@ -352,11 +489,11 @@ function renderRecon(){
   const pct=s.unique?Math.round(s.rec/s.unique*100):0;
   $('rcBar').style.width=pct+'%';
   $('rcProgText').textContent=`${s.rec} / ${s.unique} (${pct}%)`;
-  const scans=db.scans.map((x,i)=>({...x,i})).filter(x=>x.date===date&&!x.undone);
+  const scans=db.scans.filter(x=>x.date===date&&!x.undone);
   $('rcStats').innerHTML=statCard(s.returns,'Returns (sheet rows)')+statCard(s.rec,'Reconciled','ok')+statCard(s.remaining,'Remaining','err')+statCard(scans.filter(x=>x.result==='missing').length,'Cleared from missing list','info')+statCard(scans.filter(x=>x.result==='notfound').length,'Not found scans','err');
   if(!scans.length){$('scanLog').innerHTML='<div class="empty">No scans yet for this date.</div>';return;}
-  $('scanLog').innerHTML=`<table><tr><th>Time</th><th>Tracking ID</th><th>SKU</th><th>Result</th><th>Sheet date</th><th></th></tr>${scans.reverse().map(x=>`<tr><td>${fmtTime(x.at)}</td><td>${esc(x.id)}</td><td>${esc(x.sku)}</td><td>${resPill[x.result]}</td><td>${x.src?fmtDate(x.src):'—'}</td><td>${x.result==='ok'||x.result==='missing'?`<button class="btn sm" data-undo="${x.i}">Undo</button>`:''}</td></tr>`).join('')}</table>`;
-  $('scanLog').querySelectorAll('[data-undo]').forEach(b=>b.onclick=()=>undoScan(+b.dataset.undo));
+  $('scanLog').innerHTML=`<table><tr><th>Time</th><th>Tracking ID</th><th>SKU</th><th>Result</th><th>Sheet date</th><th></th></tr>${scans.slice().reverse().map(x=>`<tr><td>${fmtTime(x.at)}${x.pending?' <span class="pill muted">saving</span>':''}</td><td>${esc(x.id)}</td><td>${esc(x.sku)}</td><td>${resPill[x.result]||esc(x.result)}</td><td>${x.src?fmtDate(x.src):'—'}</td><td>${x.result==='ok'||x.result==='missing'?`<button class="btn sm" data-undo="${esc(x.sid)}">Undo</button>`:''}</td></tr>`).join('')}</table>`;
+  $('scanLog').querySelectorAll('[data-undo]').forEach(b=>b.onclick=()=>undoScan(b.dataset.undo));
 }
 
 /* ---------- Report ---------- */
@@ -389,7 +526,7 @@ $('rpExport').onclick=()=>{
     ['Myntra Returns Reconciliation Report'],['Date',fmtDate(date)],[],
     ['Returns received',s.returns],['Unique tracking IDs',s.unique],['Reconciled',s.rec],['Remaining',s.remaining],
     ['Reconciled on a later day',s.recLater],['Old missing IDs cleared on this day',r.fromMissing.length],['Not-found scans',r.unknown.length]]),'Summary');
-  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(r.reconciled.map(x=>({'Tracking ID':x.id,SKU:x.sku,'Reconciled on':fmtDate(x.recOn),'Time':x.recAt?fmtTime(x.recAt):''}))),'Reconciled');
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(r.reconciled.map(x=>({'Tracking ID':x.id,SKU:x.sku,'Reconciled on':fmtDate(x.recOn),'Time':fmtTime(x.recAt)}))),'Reconciled');
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(r.remaining.map(x=>({'Tracking ID':x.id,SKU:x.sku}))),'Remaining');
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(r.fromMissing.map(x=>({'Tracking ID':x.id,SKU:x.sku,'Original sheet date':fmtDate(x.src)}))),'Cleared from missing');
   XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(r.unknown.map(x=>({'Tracking ID':x.id,'Scanned at':fmtTime(x.at)}))),'Not found scans');
@@ -415,27 +552,39 @@ $('msExport').onclick=()=>{
   XLSX.writeFile(wb,`Myntra_Missing_IDs_${fmtDate(todayStr())}.xlsx`);
 };
 
-/* ---------- Backup / restore ---------- */
+/* ---------- Backup / import ---------- */
 $('backupBtn').onclick=()=>{
   const a=document.createElement('a');
   a.href=URL.createObjectURL(new Blob([JSON.stringify(db)],{type:'application/json'}));
   a.download=`myntra-recon-backup-${todayStr()}.json`;a.click();
 };
-$('restoreBtn').onclick=()=>$('restoreFile').click();
+$('restoreBtn').onclick=()=>{if(!needConn())$('restoreFile').click();};
 $('restoreFile').onchange=async e=>{
-  const f=e.target.files[0];if(!f)return;
+  const f=e.target.files[0];e.target.value='';if(!f)return;
   try{const d=JSON.parse(await f.text());if(!d.days)throw new Error('Not a backup file');
-    if(!confirm('Replace all current data with this backup?'))return;
-    db=d;db.scans=db.scans||[];save();renderAll();toast('Backup restored');
-  }catch(err){toast('Restore failed: '+err.message);}
-  e.target.value='';
+    if(!confirm('Add the data from this backup to the Google Sheet? Entries already in the sheet are skipped.'))return;
+    busy++;renderSync();
+    const res=await api('import',{db:d});db=res.db;renderAll();
+    toast(`Imported ${res.imported.uploads} sheets, ${res.imported.items} tracking IDs, ${res.imported.scans} scans`);
+  }catch(err){toast('Import failed: '+err.message);}
+  busy=Math.max(0,busy-1);renderSync();
 };
 
 function renderAll(){
   renderUpload();renderRecon();renderReport();renderMissing();
   const n=allPending().length;$('missBadge').textContent=n;$('missBadge').style.display=n?'inline-block':'none';
+  renderSync();
 }
-renderAll();
+
+/* ---------- Start ---------- */
+(async function boot(){
+  renderAll();
+  if(!apiUrl()||!cfg.key){openSetup();return;}
+  $('loading').hidden=false;
+  try{const res=await api('state');db=res.db;connected=true;}
+  catch(e){$('loading').hidden=true;openSetup(e.message);renderSync();return;}
+  $('loading').hidden=true;renderAll();checkOld();
+})();
 </script>
 </body>
 </html>
