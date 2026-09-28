@@ -77,6 +77,15 @@ tr.clickable{cursor:pointer}tr.clickable:hover{background:var(--bg)}
 .sync.ok i{background:var(--ok)}.sync.busy i{background:var(--warn)}.sync.err i{background:var(--err)}
 .sync.err{color:var(--err)}
 .btn:disabled{opacity:.55;cursor:not-allowed}
+.mode{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}
+.mode button{font:inherit;font-weight:600;padding:12px;border-radius:10px;border:2px solid var(--line);background:var(--card);color:var(--muted);cursor:pointer}
+.mode button.on.d{border-color:var(--ok);background:var(--ok-soft);color:var(--ok)}
+.mode button.on.c{border-color:var(--err);background:var(--err-soft);color:var(--err)}
+.scan-input.cancel,.scan-input.cancel:focus{border:2px solid var(--err);outline:2px solid var(--err-soft)}
+.scan-input.disp,.scan-input.disp:focus{border:2px solid var(--ok);outline:2px solid var(--ok-soft)}
+.grid2>*{min-width:0}
+tr.total td{font-weight:700;border-top:2px solid var(--line)}
+tr.sel{background:var(--accent-soft)}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 @media (max-width:760px){.grid2{grid-template-columns:1fr}}
 </style>
@@ -111,6 +120,7 @@ tr.clickable{cursor:pointer}tr.clickable:hover{background:var(--bg)}
   <button data-tab="recon">Reconcile</button>
   <button data-tab="report">Report</button>
   <button data-tab="missing">Missing IDs <span class="badge" id="missBadge">0</span></button>
+  <button data-tab="dispatch">📦 Dispatch</button>
 </nav>
 
 <main>
@@ -187,6 +197,35 @@ tr.clickable{cursor:pointer}tr.clickable:hover{background:var(--bg)}
   </div>
   <div class="card"><div class="tbl-wrap" id="msTable" style="max-height:640px"></div></div>
 </section>
+<!-- DISPATCH -->
+<section id="tab-dispatch">
+  <div class="card">
+    <div class="mode">
+      <button id="modeD" class="d on">📦 Dispatch</button>
+      <button id="modeC" class="c">✖ Cancel order</button>
+    </div>
+    <div class="muted" style="font-size:13px;margin-bottom:8px" id="dsHint"></div>
+    <input class="scan-input disp" id="dsInput" placeholder="Scan to dispatch…" autocomplete="off">
+    <div class="result" id="dsResult"></div>
+  </div>
+  <div class="stats" id="dsStats"></div>
+  <div class="grid2">
+    <div class="card">
+      <div class="row" style="justify-content:space-between;margin-bottom:12px">
+        <div><label>Month</label><input type="month" id="dsMonth"></div>
+        <button class="btn primary" id="dsExport">Download month (.xlsx)</button>
+      </div>
+      <div class="tbl-wrap" id="dsMonthTable"></div>
+    </div>
+    <div class="card">
+      <div class="row" style="margin-bottom:12px">
+        <div><label>Day</label><input type="date" id="dsDay"></div>
+        <div style="flex:1;min-width:160px"><label>Search</label><input id="dsSearch" placeholder="Tracking ID" style="width:100%"></div>
+      </div>
+      <div class="tbl-wrap" id="dsDayTable"></div>
+    </div>
+  </div>
+</section>
 </main>
 <div id="toast"></div>
 
@@ -199,10 +238,11 @@ const API_URL_DEFAULT='https://script.google.com/macros/s/AKfycbxFr1qRsdX2CufgDD
 const CFG_KEY='rawayi_myntra_recon_cfg';
 const OLD_KEY='rawayi_myntra_recon_v1';
 let cfg=loadCfg();
-let db={days:{},scans:[]};
+let db={days:{},scans:[],dispatch:[]};
 let pending=null,busy=0,lastErr=null,connected=false,lastShownSid=null;
 const queue=[];let pumping=false;
 
+function setDb(d){db=d||{};db.days=db.days||{};db.scans=db.scans||[];db.dispatch=db.dispatch||[];}
 function loadCfg(){try{return JSON.parse(localStorage.getItem(CFG_KEY))||{};}catch(e){return{};}}
 function saveCfg(){try{localStorage.setItem(CFG_KEY,JSON.stringify(cfg));}catch(e){}}
 const apiUrl=()=>(cfg.url||API_URL_DEFAULT||'').trim();
@@ -250,7 +290,7 @@ window.addEventListener('beforeunload',e=>{if(queue.length){e.preventDefault();e
 
 async function refresh(showToast){
   if(!ready()||queue.length||pumping||busy)return;
-  try{const res=await api('state');if(queue.length||busy)return;db=res.db;lastErr=null;renderAll();if(showToast)toast('Up to date');}
+  try{const res=await api('state');if(queue.length||busy)return;setDb(res.db);lastErr=null;renderAll();if(showToast)toast('Up to date');}
   catch(e){lastErr=e.message;if(showToast)toast(e.message);}
   renderSync();
 }
@@ -274,7 +314,7 @@ $('cfgSave').onclick=async()=>{
   $('cfgSave').disabled=true;$('cfgSave').textContent='Connecting…';$('cfgErr').textContent='';
   try{
     const res=await api('state',{},url,key);
-    cfg={url,key};saveCfg();connected=true;lastErr=null;db=res.db;
+    cfg={url,key};saveCfg();connected=true;lastErr=null;setDb(res.db);
     $('setup').hidden=true;renderAll();checkOld();toast('Connected to Google Sheet');
   }catch(e){$('cfgErr').textContent=e.message;}
   $('cfgSave').disabled=false;$('cfgSave').textContent='Connect';renderSync();
@@ -290,7 +330,7 @@ function checkOld(){
 $('oldMove').onclick=async()=>{
   const old=readOld();if(!old)return;
   $('oldMove').disabled=true;$('oldMove').textContent='Moving…';
-  try{const res=await api('import',{db:old});db=res.db;localStorage.removeItem(OLD_KEY);renderAll();checkOld();
+  try{const res=await api('import',{db:old});setDb(res.db);localStorage.removeItem(OLD_KEY);renderAll();checkOld();
     toast(`Moved ${res.imported.uploads} sheets, ${res.imported.items} tracking IDs, ${res.imported.scans} scans`);}
   catch(e){toast('Move failed: '+e.message);}
   $('oldMove').disabled=false;$('oldMove').textContent='Move it to Google Sheet';
@@ -323,6 +363,7 @@ function showTab(t){
   document.querySelectorAll('section').forEach(s=>s.classList.toggle('active',s.id==='tab-'+t));
   renderAll();
   if(t==='recon')setTimeout(()=>$('scanInput').focus(),50);
+  if(t==='dispatch')setTimeout(()=>$('dsInput').focus(),50);
 }
 
 /* ---------- Upload ---------- */
@@ -387,7 +428,7 @@ async function commitUpload(ids){
   try{
     if(!await waitQueue())throw new Error('Scans are still waiting to save. Check the connection and try again.');
     const res=await api('upload',{date,name:pending.name,ids});
-    db=res.db;clearPreview();renderAll();
+    setDb(res.db);clearPreview();renderAll();
     toast(`Added ${res.rows} returns to ${fmtDate(date)}${res.dup?` (${res.dup} IDs already in this day)`:''}`);
   }catch(e){toast('Upload failed: '+e.message);if($('pvAdd')){$('pvAdd').disabled=false;$('pvAdd').textContent='Add sheet';}}
   busy--;renderSync();
@@ -396,7 +437,7 @@ async function runDelete(action,data,okMsg){
   busy++;renderSync();
   try{
     if(!await waitQueue())throw new Error('Scans are still waiting to save. Try again in a moment.');
-    const res=await api(action,data);db=res.db;renderAll();toast(okMsg);
+    const res=await api(action,data);setDb(res.db);renderAll();toast(okMsg);
   }catch(e){toast('Delete failed: '+e.message);}
   busy--;renderSync();
 }
@@ -552,6 +593,114 @@ $('msExport').onclick=()=>{
   XLSX.writeFile(wb,`Myntra_Missing_IDs_${fmtDate(todayStr())}.xlsx`);
 };
 
+/* ---------- Dispatch ---------- */
+let dsMode='D',dsLastRid=null;
+$('dsMonth').value=todayStr().slice(0,7);$('dsDay').value=todayStr();
+function setMode(m){
+  dsMode=m;$('modeD').classList.toggle('on',m==='D');$('modeC').classList.toggle('on',m==='C');
+  $('dsInput').className='scan-input '+(m==='D'?'disp':'cancel');
+  $('dsInput').placeholder=m==='D'?'Scan to dispatch…':'Scan to CANCEL…';
+  $('dsResult').className='result';renderHint();$('dsInput').focus();
+}
+function renderHint(){
+  $('dsHint').innerHTML=dsMode==='D'?`Dispatch mode: every scan is recorded as dispatched on <strong>${fmtDate(todayStr())}</strong>.`
+   :`<span style="color:var(--err)"><strong>Cancel mode:</strong> scanned orders are removed from the dispatched list.</span>`;
+}
+$('modeD').onclick=()=>setMode('D');$('modeC').onclick=()=>setMode('C');
+$('dsInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();dsScan(e.target.value);e.target.value='';}});
+const activeRec=id=>db.dispatch.find(r=>r.id===id&&r.status==='D');
+const lastCancelled=id=>db.dispatch.filter(r=>r.id===id&&r.status==='C').pop();
+function dsShow(cls,title,sub){const r=$('dsResult');r.className='result '+cls;r.innerHTML=`${title}<small>${esc(sub)}</small>`;}
+function dsFailMsg(e){return /Unknown action/i.test(e.message)?'Update Code.gs in Apps Script and deploy a New version to enable Dispatch':e.message;}
+function dsScan(raw){
+  const id=norm(raw);if(!id)return;
+  if(needConn())return;
+  const date=todayStr(),at=Date.now();
+  if(dsMode==='D'){
+    const act=activeRec(id);
+    if(act){dsShow('warn','Already dispatched',`${id} was dispatched on ${fmtDate(act.date)}`);beep(false);return;}
+    const wasC=lastCancelled(id);
+    const rid='d'+at+Math.random().toString(36).slice(2,6);
+    const rec={rid,id,date,at,status:'D',cDate:null,cAt:null,pending:true};
+    db.dispatch.push(rec);dsLastRid=rid;
+    dsShow('ok','✓ Dispatched',`${id} — ${fmtDate(date)}${wasC?` (note: this order was cancelled on ${fmtDate(wasC.cDate)})`:''}`);
+    beep(true);renderAll();
+    queue.push({action:'dispatch',data:{rid,id,date,at},done:res=>{
+      if(res.result==='dup'){db.dispatch=db.dispatch.filter(x=>x!==rec);toast(`${id} was already dispatched on ${fmtDate(res.rec.date)} (another device)`);
+        if(dsLastRid===rid)dsShow('warn','Already dispatched',`${id} was dispatched on ${fmtDate(res.rec.date)}`);}
+      else rec.pending=false;
+      renderAll();
+    },fail:e=>{db.dispatch=db.dispatch.filter(x=>x!==rec);toast(dsFailMsg(e));renderAll();}});
+    pump();
+  }else{
+    const act=activeRec(id);let prev=null;
+    if(act){prev={status:act.status,cDate:act.cDate,cAt:act.cAt};Object.assign(act,{status:'C',cDate:date,cAt:at,pending:true});
+      dsShow('err','✖ Cancelled',`${id} removed from dispatched list (was dispatched on ${fmtDate(act.date)})`);beep(true);}
+    else{const c=lastCancelled(id);
+      if(c)dsShow('warn','Already cancelled',`${id} was cancelled on ${fmtDate(c.cDate)}`);
+      else dsShow('warn','Not in dispatched list',`${id} was never scanned as dispatched`);
+      beep(false);}
+    renderAll();
+    queue.push({action:'cancel',data:{id,date,at},done:res=>{
+      if(act){if(res.rec)Object.assign(act,res.rec,{pending:false});else Object.assign(act,prev,{pending:false});}
+      else if(res.result==='ok'){const r=db.dispatch.find(x=>x.rid===res.rec.rid);if(r)Object.assign(r,res.rec);else db.dispatch.push(res.rec);
+        toast(`${id} was dispatched on another device — now cancelled`);dsShow('err','✖ Cancelled',`${id} removed from dispatched list`);}
+      renderAll();
+    },fail:e=>{if(act)Object.assign(act,prev,{pending:false});toast(dsFailMsg(e));renderAll();}});
+    pump();
+  }
+}
+function dsUndo(rid){
+  const r=db.dispatch.find(x=>x.rid===rid);if(!r)return;
+  if(r.status==='D'){
+    if(!confirm(`Remove ${r.id} from dispatched (${fmtDate(r.date)})? Use this only for a wrong scan.`))return;
+    db.dispatch=db.dispatch.filter(x=>x!==r);renderAll();
+    queue.push({action:'undoDispatch',data:{rid},fail:e=>{db.dispatch.push(r);toast(dsFailMsg(e));renderAll();}});
+  }else{
+    if(!confirm(`Restore ${r.id} as dispatched on ${fmtDate(r.date)}?`))return;
+    const prev={status:r.status,cDate:r.cDate,cAt:r.cAt};Object.assign(r,{status:'D',cDate:null,cAt:null});renderAll();
+    queue.push({action:'undoCancel',data:{rid},done:res=>{if(res.rec)Object.assign(r,res.rec);renderAll();},fail:e=>{Object.assign(r,prev);toast(dsFailMsg(e));renderAll();}});
+  }
+  pump();
+}
+function monthRows(m){
+  const days={};
+  const day=d=>days[d]||(days[d]={d:0,c:0});
+  db.dispatch.forEach(r=>{
+    if(r.status==='D'&&r.date.startsWith(m))day(r.date).d++;
+    if(r.status==='C'&&r.cDate&&r.cDate.startsWith(m))day(r.cDate).c++;
+  });
+  return Object.keys(days).sort().reverse().map(d=>({date:d,...days[d]}));
+}
+function renderDispatch(){
+  renderHint();
+  const t=todayStr(),m=t.slice(0,7);
+  const dToday=db.dispatch.filter(r=>r.status==='D'&&r.date===t).length;
+  const cToday=db.dispatch.filter(r=>r.status==='C'&&r.cDate===t).length;
+  const dMonth=db.dispatch.filter(r=>r.status==='D'&&r.date.startsWith(m)).length;
+  const cMonth=db.dispatch.filter(r=>r.status==='C'&&(r.cDate||'').startsWith(m)).length;
+  $('dsStats').innerHTML=statCard(dToday,'Dispatched today','ok')+statCard(cToday,'Cancelled today','err')+statCard(dMonth,'Dispatched this month','ok')+statCard(cMonth,'Cancelled this month','err');
+  const sm=$('dsMonth').value||m,rows=monthRows(sm),sel=$('dsDay').value;
+  const td=rows.reduce((a,r)=>a+r.d,0),tc=rows.reduce((a,r)=>a+r.c,0);
+  $('dsMonthTable').innerHTML=rows.length?`<table><tr><th>Date</th><th>Dispatched</th><th>Cancelled</th></tr>${rows.map(r=>`<tr class="clickable ${r.date===sel?'sel':''}" data-day="${r.date}"><td>${fmtDate(r.date)}</td><td>${r.d}</td><td>${r.c}</td></tr>`).join('')}<tr class="total"><td>Month total</td><td>${td}</td><td>${tc}</td></tr></table>`:'<div class="empty">No dispatches in this month.</div>';
+  $('dsMonthTable').querySelectorAll('[data-day]').forEach(tr=>tr.onclick=()=>{$('dsDay').value=tr.dataset.day;renderDispatch();});
+  const q=norm($('dsSearch').value);
+  const list=db.dispatch.filter(r=>q?r.id.includes(q):(r.date===sel||r.cDate===sel)).sort((a,b)=>(b.at||0)-(a.at||0));
+  $('dsDayTable').innerHTML=list.length?`<table><tr><th>Tracking ID</th><th>Dispatched</th><th>Status</th><th></th></tr>${list.map(r=>`<tr><td>${esc(r.id)}</td><td>${fmtDate(r.date)} ${r.at?new Date(r.at).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}):''}</td><td>${r.status==='D'?'<span class="pill ok">Dispatched</span>':`<span class="pill err">Cancelled ${fmtDate(r.cDate)}</span>`}${r.pending?' <span class="pill muted">saving</span>':''}</td><td>${r.pending?'':r.status==='D'?`<button class="btn sm" data-undo="${esc(r.rid)}">Undo</button>`:`<button class="btn sm" data-undo="${esc(r.rid)}">Restore</button>`}</td></tr>`).join('')}</table>`:`<div class="empty">${q?'No match.':'Nothing dispatched or cancelled on this day.'}</div>`;
+  $('dsDayTable').querySelectorAll('[data-undo]').forEach(b=>b.onclick=()=>dsUndo(b.dataset.undo));
+}
+$('dsMonth').onchange=renderDispatch;$('dsDay').onchange=renderDispatch;$('dsSearch').oninput=renderDispatch;
+$('dsExport').onclick=()=>{
+  const m=$('dsMonth').value||todayStr().slice(0,7),rows=monthRows(m);
+  const wb=XLSX.utils.book_new();
+  const sum=rows.slice().reverse().map(r=>({'Date':fmtDate(r.date),'Dispatched':r.d,'Cancelled':r.c}));
+  sum.push({'Date':'Total','Dispatched':rows.reduce((a,r)=>a+r.d,0),'Cancelled':rows.reduce((a,r)=>a+r.c,0)});
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(sum),'Daily summary');
+  const recs=db.dispatch.filter(r=>r.date.startsWith(m)||(r.cDate||'').startsWith(m)).sort((a,b)=>(a.at||0)-(b.at||0));
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(recs.map(r=>({'Tracking ID':r.id,'Dispatch date':fmtDate(r.date),'Dispatched at':fmtTime(r.at),'Status':r.status==='D'?'Dispatched':'Cancelled','Cancelled on':fmtDate(r.cDate)}))),'Orders');
+  XLSX.writeFile(wb,`Dispatch_${m}.xlsx`);
+};
+
 /* ---------- Backup / import ---------- */
 $('backupBtn').onclick=()=>{
   const a=document.createElement('a');
@@ -564,14 +713,14 @@ $('restoreFile').onchange=async e=>{
   try{const d=JSON.parse(await f.text());if(!d.days)throw new Error('Not a backup file');
     if(!confirm('Add the data from this backup to the Google Sheet? Entries already in the sheet are skipped.'))return;
     busy++;renderSync();
-    const res=await api('import',{db:d});db=res.db;renderAll();
+    const res=await api('import',{db:d});setDb(res.db);renderAll();
     toast(`Imported ${res.imported.uploads} sheets, ${res.imported.items} tracking IDs, ${res.imported.scans} scans`);
   }catch(err){toast('Import failed: '+err.message);}
   busy=Math.max(0,busy-1);renderSync();
 };
 
 function renderAll(){
-  renderUpload();renderRecon();renderReport();renderMissing();
+  renderUpload();renderRecon();renderReport();renderMissing();renderDispatch();
   const n=allPending().length;$('missBadge').textContent=n;$('missBadge').style.display=n?'inline-block':'none';
   renderSync();
 }
@@ -581,7 +730,7 @@ function renderAll(){
   renderAll();
   if(!apiUrl()||!cfg.key){openSetup();return;}
   $('loading').hidden=false;
-  try{const res=await api('state');db=res.db;connected=true;}
+  try{const res=await api('state');setDb(res.db);connected=true;}
   catch(e){$('loading').hidden=true;openSetup(e.message);renderSync();return;}
   $('loading').hidden=true;renderAll();checkOld();
 })();
