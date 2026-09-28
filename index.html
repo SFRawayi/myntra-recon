@@ -84,6 +84,22 @@ tr.clickable{cursor:pointer}tr.clickable:hover{background:var(--bg)}
 .scan-input.cancel,.scan-input.cancel:focus{border:2px solid var(--err);outline:2px solid var(--err-soft)}
 .scan-input.disp,.scan-input.disp:focus{border:2px solid var(--ok);outline:2px solid var(--ok-soft)}
 .grid2>*{min-width:0}
+#printArea{display:none}
+@media print{
+  body{background:#fff;color:#000}
+  body>*:not(#printArea){display:none!important}
+  #printArea{display:block;font:12px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:#000}
+  #printArea h1{font-size:20px;margin:0}
+  #printArea table{width:100%;border-collapse:collapse;margin-top:10px}
+  #printArea th,#printArea td{border:1px solid #000;padding:5px 8px;text-align:left;white-space:nowrap;color:#000}
+  #printArea th{background:#eee;position:static}
+  #printArea tr{page-break-inside:avoid}
+  .mf-head{display:flex;justify-content:space-between;align-items:flex-end;border-bottom:2px solid #000;padding-bottom:8px}
+  .mf-meta{margin-top:8px;display:flex;gap:24px;flex-wrap:wrap}
+  .mf-sign{display:grid;grid-template-columns:1fr 1fr;gap:40px;margin-top:40px;page-break-inside:avoid}
+  .mf-sign div{border-top:1px solid #000;padding-top:4px}
+  @page{margin:12mm}
+}
 tr.total td{font-weight:700;border-top:2px solid var(--line)}
 tr.sel{background:var(--accent-soft)}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
@@ -225,8 +241,22 @@ tr.sel{background:var(--accent-soft)}
       <div class="tbl-wrap" id="dsDayTable"></div>
     </div>
   </div>
+  <div class="card">
+    <h2>🖨 Print manifest</h2>
+    <div class="row">
+      <div><label>Range</label><select id="mfRange">
+        <option value="today">Today</option><option value="yesterday">Yesterday</option>
+        <option value="7">Last 7 days</option><option value="month">This month</option><option value="custom">Custom range</option></select></div>
+      <div><label>From</label><input type="date" id="mfFrom"></div>
+      <div><label>To</label><input type="date" id="mfTo"></div>
+      <button class="btn primary" id="mfPrint">🖨 Print manifest</button>
+      <button class="btn" id="mfXlsx">Download (.xlsx)</button>
+    </div>
+    <p class="muted" id="mfInfo" style="margin:10px 0 0"></p>
+  </div>
 </section>
 </main>
+<div id="printArea"></div>
 <div id="toast"></div>
 
 <script>
@@ -701,6 +731,45 @@ $('dsExport').onclick=()=>{
   XLSX.writeFile(wb,`Dispatch_${m}.xlsx`);
 };
 
+/* ---------- Manifest ---------- */
+const addDays=(s,n)=>{const d=new Date(s+'T00:00:00');d.setDate(d.getDate()+n);return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;};
+function mfSetRange(){
+  const v=$('mfRange').value,t=todayStr();
+  const set=(f,to)=>{$('mfFrom').value=f;$('mfTo').value=to;};
+  if(v==='today')set(t,t);else if(v==='yesterday')set(addDays(t,-1),addDays(t,-1));
+  else if(v==='7')set(addDays(t,-6),t);else if(v==='month')set(t.slice(0,8)+'01',t);
+  const custom=v==='custom';$('mfFrom').disabled=!custom;$('mfTo').disabled=!custom;
+  mfInfo();
+}
+function mfRows(){
+  let f=$('mfFrom').value,t=$('mfTo').value;if(f>t)[f,t]=[t,f];
+  return{f,t,rows:db.dispatch.filter(r=>r.status==='D'&&r.date>=f&&r.date<=t).sort((a,b)=>a.date<b.date?-1:a.date>b.date?1:(a.at||0)-(b.at||0))};
+}
+function mfInfo(){const{f,t,rows}=mfRows();$('mfInfo').textContent=f&&t?`${rows.length} AWB${rows.length===1?'':'s'} dispatched ${f===t?'on '+fmtDate(f):`from ${fmtDate(f)} to ${fmtDate(t)}`} (cancelled orders are excluded).`:'';}
+$('mfRange').onchange=mfSetRange;$('mfFrom').onchange=mfInfo;$('mfTo').onchange=mfInfo;
+$('mfPrint').onclick=()=>{
+  const{f,t,rows}=mfRows();
+  if(!rows.length){toast('No dispatched AWBs in this range');return;}
+  const range=f===t?fmtDate(f):`${fmtDate(f)} to ${fmtDate(t)}`;
+  const byDay={};rows.forEach(r=>byDay[r.date]=(byDay[r.date]||0)+1);
+  const days=Object.keys(byDay).sort();
+  $('printArea').innerHTML=`
+   <div class="mf-head"><div><h1>RAWAYI</h1><div>Dispatch Manifest</div></div><div style="text-align:right"><strong>${range}</strong><br>Printed: ${new Date().toLocaleString('en-IN',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'})}</div></div>
+   <div class="mf-meta"><div><strong>Total AWBs:</strong> ${rows.length}</div>${days.length>1?days.map(d=>`<div>${fmtDate(d)}: ${byDay[d]}</div>`).join(''):''}</div>
+   <table><thead><tr><th style="width:60px">S.No</th><th style="width:130px">Date</th><th>AWB No.</th></tr></thead>
+   <tbody>${rows.map((r,i)=>`<tr><td>${i+1}</td><td>${fmtDate(r.date)}</td><td>${esc(r.id)}</td></tr>`).join('')}</tbody></table>
+   <div class="mf-sign"><div>Handed over by (Rawayi) — Name &amp; Sign</div><div>Received by (Courier) — Name, Sign &amp; Date</div></div>`;
+  window.print();
+};
+$('mfXlsx').onclick=()=>{
+  const{f,t,rows}=mfRows();
+  if(!rows.length){toast('No dispatched AWBs in this range');return;}
+  const wb=XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(rows.map((r,i)=>({'S.No':i+1,'Date':fmtDate(r.date),'AWB No.':r.id}))),'Manifest');
+  XLSX.writeFile(wb,`Manifest_${f}${f===t?'':'_to_'+t}.xlsx`);
+};
+mfSetRange();
+
 /* ---------- Backup / import ---------- */
 $('backupBtn').onclick=()=>{
   const a=document.createElement('a');
@@ -720,7 +789,7 @@ $('restoreFile').onchange=async e=>{
 };
 
 function renderAll(){
-  renderUpload();renderRecon();renderReport();renderMissing();renderDispatch();
+  renderUpload();renderRecon();renderReport();renderMissing();renderDispatch();if($('mfInfo'))mfInfo();
   const n=allPending().length;$('missBadge').textContent=n;$('missBadge').style.display=n?'inline-block':'none';
   renderSync();
 }
