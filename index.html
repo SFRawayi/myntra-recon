@@ -63,6 +63,10 @@ tr.clickable{cursor:pointer}tr.clickable:hover{background:var(--bg)}
 .result.info{display:block;background:var(--info-soft);color:var(--info)}
 .result.warn{display:block;background:var(--warn-soft);color:var(--warn)}
 .result.err{display:block;background:var(--err-soft);color:var(--err)}
+.result.invalid{display:block;background:var(--err);color:#fff;animation:flash .5s ease 2}
+@keyframes flash{50%{opacity:.35}}
+@keyframes shake{20%,60%{transform:translateX(-6px)}40%,80%{transform:translateX(6px)}}
+.shake{animation:shake .35s}
 .muted{color:var(--muted)}.empty{color:var(--muted);padding:20px;text-align:center}
 .preview{margin-top:14px;padding:14px;border:1px dashed var(--line);border-radius:10px;display:none}
 #toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 18px;border-radius:8px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:9}
@@ -167,7 +171,7 @@ tr.sel{background:var(--accent-soft)}
   <div class="card">
     <div class="row" style="margin-bottom:12px">
       <div><label>Reconciling date</label><input type="date" id="rcDate"></div>
-      <div class="muted" style="font-size:13px;padding-bottom:10px">Scan or type a tracking ID and press Enter. It is checked against this date's sheets, then against the Missing IDs list.</div>
+      <div class="muted" style="font-size:13px;padding-bottom:10px">Scan or type a tracking ID and press Enter. Only AWBs starting with MY, SDL or FMP are accepted. Each one is checked against this date's sheets, then against the Missing IDs list.</div>
     </div>
     <input class="scan-input" id="scanInput" placeholder="Scan tracking ID…" autocomplete="off" autofocus>
     <div class="result" id="scanResult"></div>
@@ -225,6 +229,19 @@ tr.sel{background:var(--accent-soft)}
     <div class="result" id="dsResult"></div>
   </div>
   <div class="stats" id="dsStats"></div>
+  <div class="card">
+    <h2>🖨 Print manifest</h2>
+    <div class="row">
+      <div><label>Range</label><select id="mfRange">
+        <option value="today">Today</option><option value="yesterday">Yesterday</option>
+        <option value="7">Last 7 days</option><option value="month">This month</option><option value="custom">Custom range</option></select></div>
+      <div><label>From</label><input type="date" id="mfFrom"></div>
+      <div><label>To</label><input type="date" id="mfTo"></div>
+      <button class="btn primary" id="mfPrint">🖨 Print manifest</button>
+      <button class="btn" id="mfXlsx">Download (.xlsx)</button>
+    </div>
+    <p class="muted" id="mfInfo" style="margin:10px 0 0"></p>
+  </div>
   <div class="grid2">
     <div class="card">
       <div class="row" style="justify-content:space-between;margin-bottom:12px">
@@ -240,19 +257,6 @@ tr.sel{background:var(--accent-soft)}
       </div>
       <div class="tbl-wrap" id="dsDayTable"></div>
     </div>
-  </div>
-  <div class="card">
-    <h2>🖨 Print manifest</h2>
-    <div class="row">
-      <div><label>Range</label><select id="mfRange">
-        <option value="today">Today</option><option value="yesterday">Yesterday</option>
-        <option value="7">Last 7 days</option><option value="month">This month</option><option value="custom">Custom range</option></select></div>
-      <div><label>From</label><input type="date" id="mfFrom"></div>
-      <div><label>To</label><input type="date" id="mfTo"></div>
-      <button class="btn primary" id="mfPrint">🖨 Print manifest</button>
-      <button class="btn" id="mfXlsx">Download (.xlsx)</button>
-    </div>
-    <p class="muted" id="mfInfo" style="margin:10px 0 0"></p>
   </div>
 </section>
 </main>
@@ -286,6 +290,14 @@ const fmtDate=s=>{if(!s)return'';const[y,m,d]=s.split('-');return `${d}-${m}-${y
 const fmtTime=t=>t?new Date(t).toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}):'';
 const norm=v=>String(v??'').trim().toUpperCase().replace(/\s+/g,'');
 const cellStr=v=>(typeof v==='number'&&Number.isInteger(v))?v.toLocaleString('fullwide',{useGrouping:false}):String(v??'');
+const AWB_PREFIXES=['MY','SDL','FMP'];
+const validAwb=id=>AWB_PREFIXES.some(p=>id.startsWith(p));
+function showInvalid(boxId,inputId,id){
+  const r=$(boxId);r.className='result';void r.offsetWidth;r.className='result invalid';
+  r.innerHTML=`⚠ Invalid AWB<small style="color:#fff">${esc(id)} is not accepted. Only AWBs starting with ${AWB_PREFIXES.join(', ')} can be scanned.</small>`;
+  const inp=$(inputId);inp.classList.remove('shake');void inp.offsetWidth;inp.classList.add('shake');
+  beep(false);
+}
 function toast(m){const t=$('toast');t.textContent=m;t.classList.add('show');clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),3200);}
 let actx;function beep(ok){try{actx=actx||new(window.AudioContext||window.webkitAudioContext)();const o=actx.createOscillator(),g=actx.createGain();o.type=ok?'sine':'square';o.frequency.value=ok?880:200;g.gain.value=.08;o.connect(g);g.connect(actx.destination);o.start();o.stop(actx.currentTime+(ok?.12:.4));}catch(e){}}
 
@@ -528,6 +540,7 @@ function applyItem(it){
 }
 function doScan(raw){
   const id=norm(raw);if(!id)return;
+  if(!validAwb(id)){showInvalid('scanResult','scanInput',id);return;}
   if(needConn())return;
   const date=$('rcDate').value,at=Date.now(),sid='s'+at+Math.random().toString(36).slice(2,6);
   const src=locate(id,date);let result='notfound',sku='',prev=null,it=null;
@@ -644,6 +657,7 @@ function dsShow(cls,title,sub){const r=$('dsResult');r.className='result '+cls;r
 function dsFailMsg(e){return /Unknown action/i.test(e.message)?'Update Code.gs in Apps Script and deploy a New version to enable Dispatch':e.message;}
 function dsScan(raw){
   const id=norm(raw);if(!id)return;
+  if(!validAwb(id)){showInvalid('dsResult','dsInput',id);return;}
   if(needConn())return;
   const date=todayStr(),at=Date.now();
   if(dsMode==='D'){
